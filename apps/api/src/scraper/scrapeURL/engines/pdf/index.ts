@@ -208,10 +208,23 @@ async function scrapePDFWithReducto(
       "Content-Type": "application/json",
     },
     body: {
-      document_url: `data:application/pdf;base64,${base64Content}`,
-      advanced_options: {
-        ...(maxPages !== undefined && { page_range: [1, maxPages] }),
+      document_url: meta.rewrittenUrl ?? meta.url,
+      options: {
+        chunking: {
+          chunk_mode: "variable" as const,
+        },
       },
+      advanced_options: {
+        ...(maxPages !== undefined && {
+          page_range: {
+            start: 1,
+            end: maxPages,
+          },
+        }),
+        return_ocr_data: false,
+        table_output_format: "html" as const,
+      },
+      priority: false,
     },
     logger: meta.logger.child({
       method: "scrapePDFWithReducto/parse_async/robustFetch",
@@ -245,38 +258,59 @@ async function scrapePDFWithReducto(
         method: "scrapePDFWithReducto/job_status/robustFetch",
       }),
       schema: z.object({
-        status: z.enum(["Pending", "Complete", "Failed"]),
+        status: z.enum(["Pending", "Completed", "Failed", "Idle"]),
         result: z
           .object({
-            type: z.enum(["full", "url"]).optional(),
-            chunks: z
-              .array(
-                z.object({
-                  content: z.string(),
-                  embed: z.string().optional(),
-                }),
-              )
+            job_id: z.string().optional(),
+            duration: z.number().optional(),
+            pdf_url: z.string().nullable().optional(),
+            studio_link: z.string().nullable().optional(),
+            usage: z
+              .object({
+                num_pages: z.number(),
+                credits: z.number().nullable().optional(),
+              })
               .optional(),
-            url: z.string().optional(),
+            result: z.object({
+              type: z.enum(["full", "url"]),
+              chunks: z
+                .array(
+                  z.object({
+                    content: z.string(),
+                    embed: z.string(),
+                    enriched: z.string().nullable().optional(),
+                    enrichment_success: z.boolean().optional(),
+                    blocks: z.array(z.any()).optional(),
+                  }),
+                )
+                .optional(),
+              url: z.string().optional(),
+              result_id: z.string().optional(),
+            }),
           })
+          .nullable()
           .optional(),
+        progress: z.number().nullable().optional(),
+        reason: z.string().nullable().optional(),
       }),
       mock: meta.mock,
       abort: meta.abort.asSignal(),
     });
 
-    if (jobStatus.status === "Complete") {
+    if (jobStatus.status === "Completed") {
       let markdown = "";
 
-      if (jobStatus.result?.type === "full" && jobStatus.result.chunks) {
+      // The result is a ParseResponse which contains a nested result field
+      const parseResponse = jobStatus.result;
+      const result = parseResponse?.result;
+
+      if (result?.type === "full" && result.chunks) {
         // Content is inline
-        markdown = jobStatus.result.chunks
-          .map(chunk => chunk.content)
-          .join("\n\n");
-      } else if (jobStatus.result?.type === "url" && jobStatus.result.url) {
+        markdown = result.chunks.map(chunk => chunk.content).join("\n\n");
+      } else if (result?.type === "url" && result.url) {
         // Content is at URL
         const contentResponse = await robustFetch({
-          url: jobStatus.result.url,
+          url: result.url,
           method: "GET",
           logger: meta.logger.child({
             method: "scrapePDFWithReducto/content_fetch/robustFetch",
@@ -285,6 +319,10 @@ async function scrapePDFWithReducto(
             chunks: z.array(
               z.object({
                 content: z.string(),
+                embed: z.string().optional(),
+                enriched: z.string().nullable().optional(),
+                enrichment_success: z.boolean().optional(),
+                blocks: z.array(z.any()).optional(),
               }),
             ),
           }),
@@ -296,12 +334,16 @@ async function scrapePDFWithReducto(
           .join("\n\n");
       }
 
+      meta.logger.info("Reducto parse job completed");
+
       return {
         markdown,
         html: await marked.parse(markdown, { async: true }),
       };
     } else if (jobStatus.status === "Failed") {
-      throw new Error("Reducto failed to parse PDF");
+      throw new Error(
+        `Reducto failed to parse PDF: ${jobStatus.reason || "Unknown reason"}`,
+      );
     }
 
     attempt++;
