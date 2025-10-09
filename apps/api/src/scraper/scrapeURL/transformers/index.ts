@@ -72,7 +72,10 @@ async function deriveMarkdownFromHTML(
     );
   }
 
-  if (document.metadata.postprocessorsUsed?.includes("youtube")) {
+  if (
+    document.metadata.postprocessorsUsed?.includes("youtube") &&
+    document.markdown !== undefined
+  ) {
     return document;
   }
 
